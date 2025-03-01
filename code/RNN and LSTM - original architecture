@@ -1,0 +1,421 @@
+# Define Google Drive directory path
+data_dir = '/content/drive/My Drive/final_ex_comp_learning/prepared data - top 2 stocks from 20 sectors'
+
+# Create a results directory if it doesn't exist
+results_dir = os.path.join(data_dir, 'results')
+os.makedirs(results_dir, exist_ok=True)
+plots_dir = os.path.join(results_dir, 'plots')
+os.makedirs(plots_dir, exist_ok=True)
+
+names = train_data_file.columns
+names = list(names)
+print(f"Total number of pairs to process: {len(names)}")
+
+# Load existing results if they exist
+try:
+    # Load existing predicted series
+    predicted_series_rnn = np.load(os.path.join(results_dir, 'predicted_series_rnn.npy'), allow_pickle=True).item()
+    predicted_series_lstm = np.load(os.path.join(results_dir, 'predicted_series_lstm.npy'), allow_pickle=True).item()
+    print(f"Loaded existing prediction series with {len(predicted_series_rnn)} entries")
+except:
+    predicted_series_rnn = {}
+    predicted_series_lstm = {}
+    print("No existing prediction series found, creating new dictionaries")
+
+# Load existing results dataframes if they exist
+try:
+    rnn_results_df = pd.read_csv(os.path.join(results_dir, 'rnn_metrics_summary.csv'))
+    rnn_results_list = rnn_results_df.to_dict('records')
+    print(f"Loaded existing RNN results with {len(rnn_results_list)} entries")
+except:
+    rnn_results_list = []
+    print("No existing RNN results found, creating new list")
+
+try:
+    lstm_results_df = pd.read_csv(os.path.join(results_dir, 'lstm_metrics_summary.csv'))
+    lstm_results_list = lstm_results_df.to_dict('records')
+    print(f"Loaded existing LSTM results with {len(lstm_results_list)} entries")
+except:
+    lstm_results_list = []
+    print("No existing LSTM results found, creating new list")
+
+try:
+    all_results_df = pd.read_csv(os.path.join(results_dir, 'all_results.csv'))
+    rows_structured = all_results_df.to_dict('records')
+    # Convert structured rows back to original format for appending
+    rows = []
+    for row in rows_structured:
+        stock = row['Stock']
+        rnn_metrics = [row['RNN_R2'], row['RNN_RMSE'], row['RNN_MAE'], row['RNN_MAPE']]
+        lstm_metrics = [row['LSTM_R2'], row['LSTM_RMSE'], row['LSTM_MAE'], row['LSTM_MAPE']]
+        rows.append([stock, rnn_metrics, lstm_metrics])
+    print(f"Loaded existing combined results with {len(rows)} entries")
+except:
+    rows = []
+    print("No existing combined results found, creating new list")
+
+# Counter for processed pairs
+count = 0
+# Counter for skipped pairs
+skipped = 0
+
+# Process each pair
+for file in names:
+    # Check if this pair has already been processed by looking for plot files
+    rnn_plot_file = os.path.join(plots_dir, f'{file}_RNN_plot.png')
+    lstm_plot_file = os.path.join(plots_dir, f'{file}_LSTM_plot.png')
+
+    # Skip if both plot files exist
+    if os.path.exists(rnn_plot_file) and os.path.exists(lstm_plot_file):
+        skipped += 1
+        print(f"\nSkipping pair: {file} - Already processed")
+        continue
+
+    print("\n***************************************************************************************************************")
+    print(f"Pair Number: {count}, Processing: {file}")
+    count += 1
+
+    train_data = train_data_file[file]
+    test_data = test_data_file[file]
+    length_validation = len(test_data)
+    length_train = len(train_data)
+
+    train = np.array(train_data)
+    dataset_train = train
+    dataset_train = train.reshape(-1,1)
+
+    scaler = MinMaxScaler(feature_range = (0,1))
+
+    # scaling dataset
+    dataset_train_scaled = scaler.fit_transform(dataset_train)
+
+    X_train = []
+    y_train = []
+
+    time_step = 50
+
+    for i in range(time_step, length_train):
+        X_train.append(dataset_train_scaled[i-time_step:i,0])
+        y_train.append(dataset_train_scaled[i,0])
+
+    # convert list to array
+    X_train, y_train = np.array(X_train), np.array(y_train)
+
+
+    X_train = np.reshape(X_train, (X_train.shape[0], X_train.shape[1],1))
+    y_train = np.reshape(y_train, (y_train.shape[0],1))
+
+
+    # initializing the RNN
+    regressor = Sequential()
+
+    # adding first RNN layer and dropout regulatization
+    regressor.add(SimpleRNN(units = 50, activation = "tanh", return_sequences = True, input_shape = (X_train.shape[1],1)))
+    regressor.add(Dropout(0.2))
+
+    # # adding third RNN layer and dropout regulatization
+    regressor.add(SimpleRNN(units = 50, activation = "tanh", return_sequences = True))
+    regressor.add(Dropout(0.2))
+
+    # adding fourth RNN layer and dropout regulatization
+    regressor.add(SimpleRNN(units = 50))
+    regressor.add(Dropout(0.2))
+
+    # adding the output layer
+    regressor.add(Dense(units = 1))
+
+    # # compiling RNN
+    regressor.compile(
+        optimizer = "adam",
+        loss = "mean_squared_error")
+
+    # fitting the RNN
+    history = regressor.fit(X_train, y_train, epochs = 35, batch_size = 32, shuffle = False)
+
+    y_train = scaler.inverse_transform(y_train) # scaling back from 0-1 to original
+    y_pred = regressor.predict(X_train)  # predictions
+    y_pred = scaler.inverse_transform(y_pred) # scaling back from 0-1 to original
+
+
+    validation_data = np.array(test_data)
+    dataset_validation = validation_data  # getting "open" column and converting to array
+    dataset_validation = np.reshape(dataset_validation, (-1,1))  # converting 1D to 2D array
+    scaled_dataset_validation =  scaler.fit_transform(dataset_validation)  # scaling open values to between 0 and 1
+
+    # Creating X_test and y_test
+    X_test = []
+    y_test = []
+
+    for i in range(time_step, length_validation):
+        X_test.append(scaled_dataset_validation[i-time_step:i,0])
+        y_test.append(scaled_dataset_validation[i,0])
+
+    # Converting to array
+    X_test, y_test = np.array(X_test), np.array(y_test)
+
+    X_test = np.reshape(X_test, (X_test.shape[0],X_test.shape[1],1))  # reshape to 3D array
+    y_test = np.reshape(y_test, (-1,1))  # reshape to 2D array
+
+    # predictions with X_test data
+    y_pred_of_test = regressor.predict(X_test)
+    # scaling back from 0-1 to original
+    y_pred_of_test = scaler.inverse_transform(y_pred_of_test)
+    flattened_results = np.array(y_pred_of_test).flatten().tolist()
+    predicted_series_rnn[names.index(file)] = flattened_results
+
+    # Save predictions to CSV
+    actual_values = scaler.inverse_transform(y_test).flatten()
+    rnn_predictions_df = pd.DataFrame({
+        'Actual': actual_values,
+        'Predicted': flattened_results
+    })
+    rnn_predictions_df.to_csv(os.path.join(results_dir, f'{file}_RNN_predictions.csv'), index=False)
+
+    # visualisation
+    plt.figure(figsize = (30,10))
+    plt.plot(y_pred_of_test, label = "y_pred_of_test", c = "orange")
+    plt.plot(scaler.inverse_transform(y_test) , label = "y_test", c = "g")
+    plt.xlabel("time")
+    plt.ylabel("distance")
+    plt.title(f"RNN Testing Graph - {file}")
+    plt.legend()
+
+    # Save the plot
+    plt.savefig(os.path.join(plots_dir, f'{file}_RNN_plot.png'))
+    plt.close()
+
+    R2score = r2_score(scaler.inverse_transform(y_test), y_pred_of_test)
+    rsme = np.sqrt(mean_squared_error(scaler.inverse_transform(y_test), y_pred_of_test))
+    mape = mean_absolute_percentage_error(scaler.inverse_transform(y_test), y_pred_of_test)
+    mae = mean_absolute_error(scaler.inverse_transform(y_test), y_pred_of_test)
+    print("\nPrediction results for RNN:")
+    results_rnn = [R2score, rsme, mae, mape]
+
+    # Check if this stock is already in the RNN results list
+    existing_rnn_idx = next((i for i, item in enumerate(rnn_results_list) if item['Stock'] == file), None)
+    if existing_rnn_idx is not None:
+        # Update existing entry
+        rnn_results_list[existing_rnn_idx] = {
+            'Stock': file,
+            'R2_Score': R2score,
+            'RMSE': rsme,
+            'MAE': mae,
+            'MAPE': mape
+        }
+    else:
+        # Add new entry
+        rnn_results_list.append({
+            'Stock': file,
+            'R2_Score': R2score,
+            'RMSE': rsme,
+            'MAE': mae,
+            'MAPE': mape
+        })
+
+    # Create DataFrame after each iteration
+    rnn_results_df = pd.DataFrame(rnn_results_list)
+    rnn_results_df.to_csv(os.path.join(results_dir, 'rnn_metrics_summary.csv'), index=False)
+
+    print("r2_score: ", R2score)
+    print("MAPE: ", mape)
+    print("MAE: ", mae)
+    print("RMSE: ", rsme)
+
+    print("_____________________________")
+
+
+    ###LSTM#####
+
+    train_data = train_data_file[file]
+    test_data = test_data_file[file]
+    length_validation = len(test_data)
+    length_train = len(train_data)
+
+    train = np.array(train_data)
+    dataset_train = train
+    dataset_train = train.reshape(-1,1)
+
+    scaler = MinMaxScaler(feature_range = (0,1))
+
+    # scaling dataset
+    dataset_train_scaled = scaler.fit_transform(dataset_train)
+
+    X_train = []
+    y_train = []
+
+    time_step = 50
+
+    for i in range(time_step, length_train):
+        X_train.append(dataset_train_scaled[i-time_step:i,0])
+        y_train.append(dataset_train_scaled[i,0])
+
+    # convert list to array
+    X_train, y_train = np.array(X_train), np.array(y_train)
+
+    X_train = np.reshape(X_train, (X_train.shape[0], X_train.shape[1],1))
+    y_train = np.reshape(y_train, (y_train.shape[0],1))
+
+    #Initialise LSTM
+    regressor = Sequential()
+
+    regressor.add(LSTM(units = 50, activation = "tanh", return_sequences = True, input_shape = (X_train.shape[1],1)))
+    regressor.add(Dropout(0.2))
+
+    regressor.add(LSTM(units = 50, activation = "tanh"))
+    regressor.add(Dropout(0.2))
+
+    regressor.add(Dense(units = 1))
+
+    # # compiling RNN
+    regressor.compile(
+        optimizer = "adam",
+        loss = "mean_squared_error")
+
+    # fitting the RNN
+    history = regressor.fit(X_train, y_train, epochs = 35, batch_size = 32, shuffle = False)
+
+    y_train = scaler.inverse_transform(y_train) # scaling back from 0-1 to original
+    y_pred = regressor.predict(X_train)  # predictions
+    y_pred = scaler.inverse_transform(y_pred) # scaling back from 0-1 to original
+
+    validation_data = np.array(test_data)
+    dataset_validation = validation_data  # getting "open" column and converting to array
+    dataset_validation = np.reshape(dataset_validation, (-1,1))  # converting 1D to 2D array
+    scaled_dataset_validation =  scaler.fit_transform(dataset_validation)  # scaling open values to between 0 and 1
+
+    # Creating X_test and y_test
+    X_test = []
+    y_test = []
+
+    for i in range(time_step, length_validation):
+        X_test.append(scaled_dataset_validation[i-time_step:i,0])
+        y_test.append(scaled_dataset_validation[i,0])
+
+    # Converting to array
+    X_test, y_test = np.array(X_test), np.array(y_test)
+
+
+    X_test = np.reshape(X_test, (X_test.shape[0],X_test.shape[1],1))  # reshape to 3D array
+    y_test = np.reshape(y_test, (-1,1))  # reshape to 2D array
+
+
+    # predictions with X_test data
+    y_pred_of_test = regressor.predict(X_test)
+    # scaling back from 0-1 to original
+    y_pred_of_test = scaler.inverse_transform(y_pred_of_test)
+    flattened_results = np.array(y_pred_of_test).flatten().tolist()
+    predicted_series_lstm[names.index(file)] = flattened_results
+
+    # Save predictions to CSV
+    actual_values = scaler.inverse_transform(y_test).flatten()
+    lstm_predictions_df = pd.DataFrame({
+        'Actual': actual_values,
+        'Predicted': flattened_results
+    })
+    lstm_predictions_df.to_csv(os.path.join(results_dir, f'{file}_LSTM_predictions.csv'), index=False)
+
+    # visualisation
+    plt.figure(figsize = (30,10))
+    plt.plot(y_pred_of_test, label = "y_pred_of_test", c = "orange")
+    plt.plot(scaler.inverse_transform(y_test), label = "y_test", c = "green")
+    plt.xlabel("time")
+    plt.ylabel("distance")
+    plt.title(f"LSTM Testing Graph - {file}")
+    plt.legend()
+
+    # Save the plot
+    plt.savefig(os.path.join(plots_dir, f'{file}_LSTM_plot.png'))
+    plt.close()
+
+    R2score = r2_score(scaler.inverse_transform(y_test), y_pred_of_test)
+    rsme = np.sqrt(mean_squared_error(scaler.inverse_transform(y_test), y_pred_of_test))
+    mape = mean_absolute_percentage_error(scaler.inverse_transform(y_test), y_pred_of_test)
+    mae = mean_absolute_error(scaler.inverse_transform(y_test), y_pred_of_test)
+    print("\nPrediction results for LSTM:")
+
+    results_lstm = [R2score, rsme, mae, mape]
+
+    # Check if this stock is already in the LSTM results list
+    existing_lstm_idx = next((i for i, item in enumerate(lstm_results_list) if item['Stock'] == file), None)
+    if existing_lstm_idx is not None:
+        # Update existing entry
+        lstm_results_list[existing_lstm_idx] = {
+            'Stock': file,
+            'R2_Score': R2score,
+            'RMSE': rsme,
+            'MAE': mae,
+            'MAPE': mape
+        }
+    else:
+        # Add new entry
+        lstm_results_list.append({
+            'Stock': file,
+            'R2_Score': R2score,
+            'RMSE': rsme,
+            'MAE': mae,
+            'MAPE': mape
+        })
+
+    # Create DataFrame after each iteration
+    lstm_results_df = pd.DataFrame(lstm_results_list)
+    lstm_results_df.to_csv(os.path.join(results_dir, 'lstm_metrics_summary.csv'), index=False)
+
+    print("r2_score: ", R2score)
+    print("MAPE: ", mape)
+    print("MAE: ", mae)
+    print("RSME: ", rsme)
+
+    # Check if this stock already exists in the rows
+    existing_row_idx = next((i for i, row in enumerate(rows) if row[0] == file), None)
+
+    if existing_row_idx is not None:
+        # Update existing entry
+        rows[existing_row_idx] = [file, results_rnn, results_lstm]
+    else:
+        # Add new entry
+        final_results = [file]
+        final_results.append(results_rnn)
+        final_results.append(results_lstm)
+        rows.append(final_results)
+
+    print(f"Results for {file}:", [file, results_rnn, results_lstm])
+
+    # Save the current rows list as CSV after each iteration
+    # Convert rows to a more structured format for saving
+    rows_structured = []
+    for row in rows:
+        stock = row[0]
+        rnn_metrics = row[1]
+        lstm_metrics = row[2]
+        rows_structured.append({
+            'Stock': stock,
+            'RNN_R2': rnn_metrics[0],
+            'RNN_RMSE': rnn_metrics[1],
+            'RNN_MAE': rnn_metrics[2],
+            'RNN_MAPE': rnn_metrics[3],
+            'LSTM_R2': lstm_metrics[0],
+            'LSTM_RMSE': lstm_metrics[1],
+            'LSTM_MAE': lstm_metrics[2],
+            'LSTM_MAPE': lstm_metrics[3]
+        })
+
+    pd.DataFrame(rows_structured).to_csv(os.path.join(results_dir, 'all_results.csv'), index=False)
+
+    # Save the predicted series dictionaries after each iteration to prevent data loss
+    np.save(os.path.join(results_dir, 'predicted_series_rnn.npy'), predicted_series_rnn)
+    np.save(os.path.join(results_dir, 'predicted_series_lstm.npy'), predicted_series_lstm)
+
+    # Print progress
+    processed = count + skipped
+    print(f"\nProgress: {processed}/{len(names)} pairs ({processed/len(names)*100:.2f}%)")
+    print(f"- Processed this run: {count}")
+    print(f"- Skipped (already done): {skipped}")
+
+# Final save of the predicted series dictionaries
+np.save(os.path.join(results_dir, 'predicted_series_rnn.npy'), predicted_series_rnn)
+np.save(os.path.join(results_dir, 'predicted_series_lstm.npy'), predicted_series_lstm)
+
+print("\nAnalysis complete!")
+print(f"Total pairs processed in this run: {count}")
+print(f"Total pairs skipped (already done): {skipped}")
+print(f"Total pairs in dataset: {len(names)}")
