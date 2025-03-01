@@ -1,0 +1,401 @@
+# General libraries
+import os
+import gc
+import csv
+import json
+import warnings
+from collections import Counter
+from datetime import datetime
+
+# Numerical and data handling libraries
+import numpy as np
+import pandas as pd
+
+# Data visualization
+import matplotlib.pyplot as plt
+
+# Machine learning utilities
+from sklearn import metrics
+from sklearn.metrics import (
+    accuracy_score, f1_score, r2_score, mean_squared_error,
+    mean_absolute_error, mean_absolute_percentage_error
+)
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+
+# Deep learning libraries
+import torch
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, LSTM, Dropout, SimpleRNN
+from keras.models import Sequential
+from keras.layers import Dense, SimpleRNN, LSTM, Dropout
+
+# File handling
+from scipy.io import loadmat
+
+# Colab utilities
+from google.colab import drive
+from tqdm import tqdm
+
+# Suppress warnings
+warnings.filterwarnings("ignore")
+
+# Mount Google Drive
+drive.mount('/content/drive')
+
+# Function foe converting volume to float
+def change_volume_to_float(series):
+
+    # Extract numeric part and convert to float
+    numeric_series = series.str.extract(r'([0-9.]+)')[0].astype(float)
+
+    # Extract unit part (M or B)
+    unit_series = series.str.extract(r'([MB])')[0].fillna('')
+
+    # Create multiplier series
+    multipliers = {
+        'M': 1_000_000,
+        'B': 1_000_000_000,
+        '': 1  # Default multiplier for no unit
+    }
+
+    # Convert units to multipliers and multiply
+    converted_series = numeric_series * unit_series.map(multipliers)
+
+    return converted_series
+
+# Function to Normalize time series by subtracting mean and dividing by std dev
+def normalize_series(series):
+    stock_mean = np.mean(series)
+    stock_sd = np.std(series)
+
+    if stock_sd == 0:
+        print("WARNING: Standard deviation is zero!")
+        return np.zeros_like(series)
+
+    series_normalized = (series - stock_mean) / stock_sd
+    return series_normalized
+
+def embed_time_series(series, dimension=4, delay=1):
+    """Embed time series in higher dimensional space
+
+    Args:
+        series: 1D numpy array of time series data
+        dimension: Embedding dimension
+        delay: Time delay between points
+
+    Returns:
+        2D numpy array where each row is a point in the embedded space
+    """
+    # Convert series to numpy array to ensure numerical indexing
+    series = series.to_numpy()  # Added line
+    N = len(series) - (dimension - 1) * delay
+    embedded = np.zeros((N, dimension))
+
+    for i in range(N):
+        for j in range(dimension):
+            embedded[i, j] = series[i + j * delay]
+
+    return embedded
+
+def create_embedded_vectors(df):
+    vol = change_volume_to_float(df['Vol.'])
+    vol_normalized = normalize_series(vol)
+    price_normalized = normalize_series(df['Price'])
+    embed_time_series_price = embed_time_series(price_normalized)
+    embed_time_series_volume = embed_time_series(vol_normalized)
+    pr_stock = np.hstack((embed_time_series_price, embed_time_series_volume))
+    return pr_stock
+
+def calculate_distance_matrix(df_stock_1, df_stock_2):
+    """
+    Calculate the distance matrix D^k_ij between two stocks
+
+    Args:
+        df_stock_1: as dataframe of the first stock containing raw price and volume data
+        df_stock_2: as dataframe of the second stock containing raw price and volume data
+
+    Returns:
+        D: Distance matrix where D[i,j] = ||X_i - Y_j||
+    """
+    # Create embedded vectors X_i and Y_j
+    X = create_embedded_vectors(df_stock_1)
+    Y = create_embedded_vectors(df_stock_2)
+
+    # Calculate distance matrix
+    n_x, n_y = len(X), len(Y)
+    D = np.zeros((n_x, n_y))
+
+    for i in range(n_x):
+        for j in range(n_y):
+            # Calculate Euclidean distance between X_i and Y_j
+            D[i,j] = np.linalg.norm(X[i] - Y[j])
+
+    return D
+
+# Function for creating distance matrix efficiantly
+def calculate_distance_matrix_gpu(df_stock_1, df_stock_2, batch_size=1000):
+    """
+    Calculate distance matrix using GPU acceleration
+
+    Args:
+        df_stock_1: DataFrame of first stock
+        df_stock_2: DataFrame of second stock
+        batch_size: Size of batches for GPU processing
+    """
+    # Check if GPU is available
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    # Create embedded vectors
+    X = create_embedded_vectors(df_stock_1)
+    Y = create_embedded_vectors(df_stock_2)
+
+    # Convert to PyTorch tensors and move to GPU
+    X = torch.tensor(X, dtype=torch.float32).to(device)
+    Y = torch.tensor(Y, dtype=torch.float32).to(device)
+
+    n_x, n_y = len(X), len(Y)
+    D = torch.zeros((n_x, n_y), device=device)
+
+    # Process in batches
+    for i in range(0, n_x, batch_size):
+        i_end = min(i + batch_size, n_x)
+        X_batch = X[i:i_end]
+
+        for j in range(0, n_y, batch_size):
+            j_end = min(j + batch_size, n_y)
+            Y_batch = Y[j:j_end]
+
+            # Compute distances for current batch
+            # Using broadcasting for efficient computation
+            diff = X_batch.unsqueeze(1) - Y_batch.unsqueeze(0)
+            D[i:i_end, j:j_end] = torch.norm(diff, dim=2)
+
+        print(f"Processed up to {i_end}/{n_x} rows")
+
+    # Move result back to CPU and convert to numpy
+    return D.cpu().numpy()
+
+def calculate_distance_matrix_gpu_optimized(df_stock_1, df_stock_2, batch_size=1000):
+    """
+    Memory-optimized version of GPU distance matrix calculation
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Create embedded vectors
+    X = create_embedded_vectors(df_stock_1)
+    Y = create_embedded_vectors(df_stock_2)
+
+    # Convert to PyTorch tensors
+    X = torch.tensor(X, dtype=torch.float32)
+    Y = torch.tensor(Y, dtype=torch.float32)
+
+    n_x, n_y = len(X), len(Y)
+    D = np.zeros((n_x, n_y))
+
+    # Process in batches with memory optimization
+    for i in range(0, n_x, batch_size):
+        i_end = min(i + batch_size, n_x)
+        X_batch = X[i:i_end].to(device)
+
+        batch_distances = []
+        for j in range(0, n_y, batch_size):
+            j_end = min(j + batch_size, n_y)
+            Y_batch = Y[j:j_end].to(device)
+
+            # Compute distances
+            diff = X_batch.unsqueeze(1) - Y_batch.unsqueeze(0)
+            batch_D = torch.norm(diff, dim=2)
+
+            # Move batch result to CPU immediately
+            D[i:i_end, j:j_end] = batch_D.cpu().numpy()
+
+            # Clear GPU memory
+            del diff, batch_D
+            torch.cuda.empty_cache()
+
+        #print(f"Processed up to {i_end}/{n_x} rows")
+
+        # Clear GPU memory after each major batch
+        del X_batch
+        torch.cuda.empty_cache()
+
+    return D
+
+def create_crp(distance_matrix, threshold):
+    crp = (distance_matrix <= threshold).astype(int)
+    return crp
+
+def create_Z_series(distance_matrix, block_size):
+    """
+    Create time series Z from distance matrix using block averaging
+
+    Args:
+        distance_matrix: 2D numpy array containing D^k_ij values
+        block_size: Size of blocks to average (n x n)
+
+    Returns:
+        Z: Time series containing average distances
+    """
+    N = len(distance_matrix)
+    num_blocks = N - block_size + 1
+    Z = np.zeros(num_blocks)
+
+    for t in range(num_blocks):
+        # Extract block
+        block = distance_matrix[t:t+block_size, t:t+block_size]
+
+        # Check if block has valid values
+        if block.size > 0 and not np.all(np.isnan(block)):
+            # Calculate average of all valid entries in block
+            block_avg = np.nanmean(block)  # Using nanmean instead of mean
+            Z[t] = block_avg
+        else:
+            Z[t] = np.nan  # Set to NaN if block is empty or all NaN
+
+    return Z
+
+
+def process_stock_files_chunked(data_dir, chunk_size=1000, output_file="merged_stocks.csv", start_date=None):
+    """
+    Process stock CSV files in chunks to reduce memory usage
+    """
+    stock_files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
+
+    # Create empty output file with headers
+    first_chunk = True
+
+    for file in tqdm(stock_files, desc="Processing files"):
+        file_path = os.path.join(data_dir, file)
+
+        # Process file in chunks
+        for chunk in pd.read_csv(file_path, dtype=str, chunksize=chunk_size):
+            # Clean numeric columns
+            chunk['Price'] = chunk['Price'].str.replace(',', '').astype(float)
+            chunk['Vol.'] = chunk['Vol.'].str.replace(',', '')
+
+            # Convert date
+            chunk['Date'] = pd.to_datetime(chunk['Date'])
+
+            # Filter by start_date if provided
+            if start_date:
+                start_date = pd.to_datetime(start_date)
+                chunk = chunk[chunk['Date'] >= start_date]
+
+            # Add stock identifier
+            chunk['Stock'] = file.replace('.csv', '')
+
+            # Write to output file
+            chunk.to_csv(output_file, mode='a' if not first_chunk else 'w',
+                        header=first_chunk, index=False)
+            first_chunk = False
+
+            # Clear memory
+            del chunk
+            gc.collect()
+
+    return output_file
+
+def process_stock_pair(df_stock_1, df_stock_2, threshold, block_size, batch_size=100):
+    """
+    Process a single pair of stocks with memory optimization
+    """
+    # Calculate distance matrix using GPU with memory optimization
+    distance_matrix = calculate_distance_matrix_gpu_optimized(df_stock_1, df_stock_2, batch_size)
+
+    # Create CRP and immediately delete distance matrix to free memory
+    crp_matrix = create_crp(distance_matrix, threshold)
+
+    # Calculate Z series
+    Z_series = create_Z_series(distance_matrix, block_size)
+
+    # Clear large objects from memory
+    del distance_matrix
+    gc.collect()
+
+    return crp_matrix, Z_series
+
+def main_optimized(stock_data, threshold, block_size, batch_size=100):
+    """
+    Memory-optimized main function that processes stocks in batches
+    """
+    unique_stocks = stock_data['Stock'].unique()
+    total_pairs = len(unique_stocks) * (len(unique_stocks) - 1) // 2
+
+    # Initialize results storage
+    z_series_dict = {}
+    processed_pairs = []
+
+    # Process pairs with progress bar
+    with tqdm(total=total_pairs, desc="Processing stock pairs") as pbar:
+        for i in range(len(unique_stocks)):
+            for j in range(i + 1, len(unique_stocks)):
+                stock_1, stock_2 = unique_stocks[i], unique_stocks[j]
+
+                # Get stock data
+                df_stock_1 = stock_data[stock_data['Stock'] == stock_1].drop(columns=['Stock'])
+                df_stock_2 = stock_data[stock_data['Stock'] == stock_2].drop(columns=['Stock'])
+
+                # Process pair
+                _, Z_series = process_stock_pair(
+                    df_stock_1, df_stock_2,
+                    threshold, block_size,
+                    batch_size
+                )
+
+                # Store results
+                pair_name = f"{stock_1}_vs_{stock_2}"
+                z_series_dict[pair_name] = Z_series
+                processed_pairs.append(pair_name)
+
+                # Clear memory
+                del df_stock_1, df_stock_2
+                gc.collect()
+
+                pbar.update(1)
+
+    # Create Z matrix efficiently
+    max_length = max(len(z) for z in z_series_dict.values())
+    z_matrix = pd.DataFrame(
+        index=range(max_length),
+        columns=processed_pairs,
+        dtype=np.float32  # Use float32 instead of float64 to save memory
+    )
+
+    # Fill Z matrix
+    for pair in processed_pairs:
+        z_matrix[pair][:len(z_series_dict[pair])] = z_series_dict[pair]
+
+    return z_matrix
+
+def run_analysis(data_dir, output_dir, threshold=0.3, block_size=20, batch_size=100):
+    """
+    Run the complete analysis without chunk processing.
+    """
+    # Process files and merge data
+    merged_file = process_stock_files_chunked(
+        data_dir,
+        chunk_size=1000,  # This part still processes files in chunks but loads everything at once
+        output_file=os.path.join(output_dir, "merged_stocks.csv"),
+        start_date="2015-01-01"
+    )
+
+    # Read the entire merged file at once
+    stock_data = pd.read_csv(merged_file)
+
+    # Process all data in one go
+    z_matrix = main_optimized(
+        stock_data,
+        threshold=threshold,
+        block_size=block_size,
+        batch_size=batch_size
+    )
+
+    return z_matrix
+
+# Create data for analysis
+data_dir = '/content/drive/My Drive/final_ex_comp_learning/prepared data'
+output_dir = "/content/drive/My Drive/final_ex_comp_learning"
+data_for_analysis = run_analysis(data_dir, output_dir, threshold=0.3, block_size=20, batch_size=100)
+
